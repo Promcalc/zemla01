@@ -4,53 +4,116 @@ import time
 import json
 import feedparser
 import requests
+import urllib3
 from datetime import datetime
 from html import unescape
 
 import gspread
 from google.oauth2.service_account import Credentials
 
+# from dotenv import load_dotenv
+
+
+# Отключаем SSL-предупреждения
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# load_dotenv()  # загружает переменные из .env
+
 # === Конфигурация ===
-RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?lotStatus=PUBLISHED,APPLICATIONS_SUBMISSION&matchPhrase=false&byFirstVersion=true"
+RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?lotStatus=PUBLISHED,APPLICATIONS_SUBMISSION&catCode=2&byFirstVersion=true"
 MAP_URL = "https://nspd.gov.ru/map?thematic=PKK&zoom=14.022938145428002&coordinate_x=10153878.513581853&coordinate_y=7361695.523330088&baseLayerId=235&theme_id=1&is_copy_url=true"
 GEO_API_BASE = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 OPR/123.0.0.0 (Edition Yx 05)"
-CADASTRAL_PATTERN = re.compile(r'\b\d{2}:\d{2}:\d{7}:\d+\b')
 
-# === Вспомогательные функции ===
+# ✅ Исправленный регэксп: поддерживает 4–19 цифр в третьей части (квартал+участок)
+CADASTRAL_PATTERN = re.compile(r'\b\d{2}:\d{2}:\d{4,19}:\d{1,6}\b')
 
-def clean_html(text):
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+def clean_html_tags(text: str) -> str:
     if not text:
         return ""
     clean = re.sub(r'<[^>]+>', '', text)
-    return unescape(clean)
+    clean = unescape(clean)
+    return clean.strip()
 
-def normalize_field_name(name):
+def normalize_field_name(name: str) -> str:
     name = name.strip()
     if name.endswith(':'):
         name = name[:-1].strip()
+    name = name.replace(':', '_')
     name = re.sub(r'\s+', ' ', name)
     return name.capitalize()
 
-def parse_description_to_dict(desc_html):
-    desc_clean = clean_html(desc_html)
-    lines = desc_clean.split('\n')
+def parse_description_fields(description_html: str) -> dict:
+    if not description_html:
+        return {}
+    partially_clean = unescape(description_html)
+    parts = re.split(r'<br\s*/?>', partially_clean, flags=re.IGNORECASE)
     fields = {}
-    for line in lines:
-        line = line.strip()
-        if not line or ':' not in line:
+    for part in parts:
+        clean_part = clean_html_tags(part)
+        clean_part = clean_part.strip()
+        if not clean_part or ':' not in clean_part:
             continue
-        parts = line.split(':', 1)
-        key = normalize_field_name(parts[0])
-        value = parts[1].strip() if len(parts) > 1 else ""
-        if key:
-            fields[key] = value
+        key_raw, value_raw = clean_part.split(':', 1)
+        key_norm = normalize_field_name(key_raw)
+        value_clean = value_raw.strip()
+        if key_norm and value_clean:
+            fields[key_norm] = value_clean
     return fields
+
+def extract_item_raw_fields(item) -> dict:
+    """Извлекает оригинальные поля из feedparser-элемента."""
+    fields = {}
+    # Стандартные поля
+    if hasattr(item, 'title') and item.title:
+        fields['title'] = item.title
+    if hasattr(item, 'link') and item.link:
+        fields['link'] = item.link
+    if hasattr(item, 'description') and item.description:
+        fields['description'] = item.description
+    if hasattr(item, 'published') and item.published:
+        fields['pubDate'] = item.published
+    if hasattr(item, 'id') and item.id:
+        fields['guid'] = item.id
+
+    # Поля из namespaces (dc:date и др.)
+    if hasattr(item, 'dc_date') and item.dc_date:
+        fields['dc:date'] = item.dc_date
+    elif 'dc' in item and 'date' in item['dc']:
+        dc_val = item['dc']['date']
+        if isinstance(dc_val, list) and dc_val:
+            fields['dc:date'] = dc_val[0]
+        elif isinstance(dc_val, str):
+            fields['dc:date'] = dc_val
+
+    return fields
+
+def extract_cadastral_number_from_item(item_fields: dict, desc_fields: dict) -> str:
+    """Ищет кадастровый номер сначала в полях, потом в тексте."""
+    # 1. В распарсенных полях description
+    for key, value in desc_fields.items():
+        if "кадастровый номер" in key.lower():
+            if CADASTRAL_PATTERN.fullmatch(value.strip()):
+                return value.strip()
+
+    # 2. В полях item (на случай, если уже есть как отдельное поле)
+    for key, value in item_fields.items():
+        if "кадастровый номер" in key.lower():
+            if CADASTRAL_PATTERN.fullmatch(str(value).strip()):
+                return str(value).strip()
+
+    # 3. В общем тексте (title + description)
+    text = item_fields.get("title", "") + " " + item_fields.get("description", "")
+    match = CADASTRAL_PATTERN.search(text)
+    return match.group(0) if match else ""
 
 def get_session_with_cookies():
     session = requests.Session()
+    session.verify = False
     session.headers.update({
         "user-agent": USER_AGENT,
         "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -101,90 +164,144 @@ def get_sheet():
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID).sheet1
 
-# === Основная логика ===
+def collect_all_field_names_from_items(items):
+    field_set = set()
+    for item in items:
+        item_fields = extract_item_raw_fields(item)
+        for key, value in item_fields.items():
+            if isinstance(value, str):
+                field_set.add(normalize_field_name(key))
+        desc_fields = parse_description_fields(item_fields.get("description", ""))
+        field_set.update(desc_fields.keys())
+    special_fields = {"Кадастровый номер", "Nspd_data", "Nspd_error", "Unsorted"}
+    field_set.update(special_fields)
+    sorted_fields = sorted([f for f in field_set if f != "Unsorted"])
+    sorted_fields.append("Unsorted")
+    return sorted_fields
+
+def build_row_for_sheet(item_fields, desc_fields, headers, cadastral_number="", nspd_data="", nspd_error=""):
+    row_dict = {}
+    for key, value in item_fields.items():
+        if isinstance(value, str):
+            field_name = normalize_field_name(key)
+            row_dict[field_name] = value
+    row_dict.update(desc_fields)
+    row_dict["Кадастровый номер"] = cadastral_number
+    row_dict["Nspd_data"] = nspd_data
+    row_dict["Nspd_error"] = nspd_error
+
+    header_to_index = {name: i for i, name in enumerate(headers)}
+    row = [""] * len(headers)
+    unsorted_pairs = []
+    for field_name, value in row_dict.items():
+        if field_name in header_to_index:
+            row[header_to_index[field_name]] = str(value) if value is not None else ""
+        else:
+            unsorted_pairs.append(f"{field_name}: {value}")
+    if "Unsorted" in header_to_index:
+        row[header_to_index["Unsorted"]] = "\n".join(unsorted_pairs)
+    return row
+
+# === ОСНОВНАЯ ЛОГИКА ===
 
 def main():
     sheet = get_sheet()
-    sheet_data = sheet.get_all_values()
-    
-    is_first_run = len(sheet_data) == 0 or not any(sheet_data[0])
-    special_cols = {"Кадастровый номер", "Geoportal данные", "nspd_error", "Unsorted"}
+
+    # === Первый запуск? (только первая строка) ===
+    try:
+        first_row = sheet.row_values(1)
+        is_first_run = not any(cell.strip() for cell in first_row)
+    except Exception:
+        is_first_run = True
 
     if is_first_run:
-        print("🆕 First run: collecting all fields from RSS items...")
-        feed = feedparser.parse(RSS_URL)
-        all_field_names = set(special_cols)
+        print("🆕 First run: downloading RSS to collect headers...")
+        rss_resp = requests.get(RSS_URL, verify=False, timeout=15)
+        rss_resp.raise_for_status()
+        feed = feedparser.parse(rss_resp.content)
+        if not feed.entries:
+            print("📭 No entries in RSS")
+            return
+        headers = collect_all_field_names_from_items(feed.entries)
+        print(f"📝 Creating header with {len(headers)} columns")
+        sheet.update(range_name='A1', values=[headers])
+        first_row = headers
+    else:
+        first_row = sheet.row_values(1)
 
-        for item in feed.entries:
-            # Все строковые поля из item
-            for key, value in item.items():
-                if isinstance(value, str):
-                    all_field_names.add(normalize_field_name(key))
-            # Поля из description
-            desc_fields = parse_description_to_dict(item.get("description", ""))
-            all_field_names.update(desc_fields.keys())
-
-        # Формируем заголовки: сначала обычные, потом Unsorted в конце
-        header_row = sorted([f for f in all_field_names if f != "Unsorted"])
-        header_row.append("Unsorted")
-
-        print(f"📝 Creating header with {len(header_row)} columns")
-        sheet.update('A1', [header_row])
-        sheet_data = [header_row]
-
-    headers = sheet_data[0]
+    headers = first_row
     header_to_col = {name: i for i, name in enumerate(headers)}
-    unsorted_col_idx = header_to_col.get("Unsorted", len(headers) - 1)
-
-    # Проверка обязательных колонок
-    required = ["Кадастровый номер", "Geoportal данные", "nspd_error"]
-    for col in required:
+    required_cols = ["Кадастровый номер", "Nspd_data", "Nspd_error", "Unsorted"]
+    for col in required_cols:
         if col not in header_to_col:
             raise RuntimeError(f"Missing required column: {col}")
 
-    session = get_session_with_cookies()
+    # === Последняя дата публикации (последние 10 строк) ===
+    pubdate_col_name = normalize_field_name("pubDate")
+    last_pub_date = None
+    if pubdate_col_name in header_to_col:
+        col_letter = gspread.utils.rowcol_to_a1(1, header_to_col[pubdate_col_name] + 1)[0]
+        total_rows = sheet.row_count
+        start_row = max(2, total_rows - 9)
+        range_name = f"{col_letter}{start_row}:{col_letter}"
+        try:
+            pubdate_values = sheet.get(range_name)
+            for row in reversed(pubdate_values):
+                if row and row[0].strip():
+                    try:
+                        last_pub_date = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+                        break
+                    except:
+                        continue
+        except Exception as e:
+            print(f"⚠️ Could not read last pubDate: {e}")
 
-    # === Шаг 1: Повторная обработка ошибок ===
+    print(f"🕗 Last processed pubDate: {last_pub_date}")
+
+    # === Повторная обработка ошибок (последние 100 строк) ===
     cad_col_idx = header_to_col["Кадастровый номер"]
-    error_col_idx = header_to_col["nspd_error"]
-    geo_col_idx = header_to_col["Geoportal данные"]
+    error_col_idx = header_to_col["Nspd_error"]
+    geo_col_idx = header_to_col["Nspd_data"]
+    cad_col_letter = gspread.utils.rowcol_to_a1(1, cad_col_idx + 1)[0]
+    error_col_letter = gspread.utils.rowcol_to_a1(1, error_col_idx + 1)[0]
 
     rows_to_update = []
-    for row_idx, row in enumerate(sheet_data[1:], start=2):
-        if len(row) <= cad_col_idx:
-            continue
-        cad_num = row[cad_col_idx].strip()
-        if not cad_num or not CADASTRAL_PATTERN.match(cad_num):
-            continue
-        if len(row) > error_col_idx and row[error_col_idx].strip():
-            print(f"🔁 Retrying failed request for {cad_num} (row {row_idx})")
-            geo_data, error = fetch_geoportal_data(session, cad_num)
-            if error is None:
-                geo_str = json.dumps(geo_data, ensure_ascii=False)
-                rows_to_update.append({
-                    "range": gspread.utils.rowcol_to_a1(row_idx, geo_col_idx + 1),
-                    "values": [[geo_str]]
-                })
-                rows_to_update.append({
-                    "range": gspread.utils.rowcol_to_a1(row_idx, error_col_idx + 1),
-                    "values": [[""]]
-                })
-            time.sleep(0.5)
+    total_rows = sheet.row_count
+    if total_rows >= 2:
+        start_row = max(2, total_rows - 99)
+        try:
+            cad_vals = sheet.get(f"{cad_col_letter}{start_row}:{cad_col_letter}") or []
+            err_vals = sheet.get(f"{error_col_letter}{start_row}:{error_col_letter}") or []
+            session = get_session_with_cookies()
+            for i in range(len(cad_vals)):
+                row_num = start_row + i
+                cad = cad_vals[i][0].strip() if i < len(cad_vals) and cad_vals[i] else ""
+                err = err_vals[i][0].strip() if i < len(err_vals) and err_vals[i] else ""
+                if cad and CADASTRAL_PATTERN.fullmatch(cad) and err:
+                    print(f"🔁 Retrying {cad} (row {row_num})")
+                    geo_data, error = fetch_geoportal_data(session, cad)
+                    if error is None:
+                        geo_str = json.dumps(geo_data, ensure_ascii=False)
+                        rows_to_update.append({"range": gspread.utils.rowcol_to_a1(row_num, geo_col_idx + 1), "values": [[geo_str]]})
+                        rows_to_update.append({"range": gspread.utils.rowcol_to_a1(row_num, error_col_idx + 1), "values": [[""]]})
+                    time.sleep(0.5)
+        except Exception as e:
+            print(f"⚠️ Error during retry: {e}")
 
     if rows_to_update:
-        print(f"📤 Updating {len(rows_to_update)} fixed rows...")
-        for update in rows_to_update:
-            sheet.update(update["range"], update["values"])
-        sheet_data = sheet.get_all_values()  # обновляем после изменений
+        print(f"📤 Updating {len(rows_to_update)} rows")
+        for upd in rows_to_update:
+            sheet.update(range_name=upd["range"], values=upd["values"])
 
-    # === Шаг 2: Обработка новых лотов по pubDate ===
-    print("🔍 Fetching RSS feed...")
-    feed = feedparser.parse(RSS_URL)
+    # === Обработка новых лотов из RSS ===
+    print("🔍 Fetching RSS for new lots...")
+    rss_resp = requests.get(RSS_URL, verify=False, timeout=15)
+    rss_resp.raise_for_status()
+    feed = feedparser.parse(rss_resp.content)
     if not feed.entries:
         print("📭 No RSS entries")
         return
 
-    # Собираем и сортируем по pubDate
     rss_items = []
     for item in feed.entries:
         pub_dt = None
@@ -196,70 +313,32 @@ def main():
         rss_items.append((pub_dt, item))
     rss_items.sort(key=lambda x: x[0] or datetime.min)
 
-    # Находим последнюю дату в таблице
-    pubdate_col_name = normalize_field_name("pubDate")  # = "Pubdate"
-    last_pub_date = None
-    if pubdate_col_name in header_to_col:
-        col_idx = header_to_col[pubdate_col_name]
-        for row in reversed(sheet_data[1:]):
-            if len(row) > col_idx and row[col_idx].strip():
-                try:
-                    last_pub_date = datetime.fromisoformat(row[col_idx].replace("Z", "+00:00"))
-                    break
-                except:
-                    continue
-
-    print(f"🕗 Last processed pubDate: {last_pub_date}")
-
     new_rows = []
     for pub_dt, item in rss_items:
         if pub_dt and last_pub_date and pub_dt <= last_pub_date:
             continue
 
-        # Собираем все данные
-        row_dict = {}
+        item_fields = extract_item_raw_fields(item)
+        desc_fields = parse_description_fields(item_fields.get("description", ""))
+        cad_num = extract_cadastral_number_from_item(item_fields, desc_fields)
 
-        # 1. Все строковые поля из item
-        for key, value in item.items():
-            if isinstance(value, str):
-                field_name = normalize_field_name(key)
-                row_dict[field_name] = value
-
-        # 2. Поля из description
-        desc_fields = parse_description_to_dict(item.get("description", ""))
-        row_dict.update(desc_fields)
-
-        # 3. Приводим pubDate к ISO (если есть)
-        if pub_dt:
-            row_dict[pubdate_col_name] = pub_dt.isoformat()
-
-        # 4. Кадастровый номер
-        cad_text = str(row_dict.get("Описание", "")) + " " + item.get("description", "")
-        cad_match = CADASTRAL_PATTERN.search(cad_text)
-        cad_num = cad_match.group(0) if cad_match else None
-
+        nspd_data, nspd_error = "", ""
         if cad_num:
-            row_dict["Кадастровый номер"] = cad_num
+            session = get_session_with_cookies()  # или переиспользуйте сессию
             geo_data, error = fetch_geoportal_data(session, cad_num)
-            row_dict["Geoportal данные"] = json.dumps(geo_data, ensure_ascii=False) if error is None else ""
-            row_dict["nspd_error"] = "" if error is None else error
-        else:
-            row_dict["Кадастровый номер"] = ""
-            row_dict["Geoportal данные"] = ""
-            row_dict["nspd_error"] = ""
-
-        # 5. Формируем строку
-        row = [""] * len(headers)
-        unsorted_pairs = []
-        for field_name, value in row_dict.items():
-            if field_name in header_to_col:
-                row[header_to_col[field_name]] = str(value) if value is not None else ""
+            if error is None:
+                nspd_data = json.dumps(geo_data, ensure_ascii=False)
             else:
-                unsorted_pairs.append(f"{field_name}: {value}")
+                nspd_error = error
 
-        if unsorted_pairs:
-            row[unsorted_col_idx] = "\n".join(unsorted_pairs)
-
+        row = build_row_for_sheet(
+            item_fields=item_fields,
+            desc_fields=desc_fields,
+            headers=headers,
+            cadastral_number=cad_num,
+            nspd_data=nspd_data,
+            nspd_error=nspd_error
+        )
         new_rows.append(row)
         time.sleep(0.5)
 
@@ -267,7 +346,7 @@ def main():
         print(f"✅ Appending {len(new_rows)} new rows")
         sheet.append_rows(new_rows)
     else:
-        print("📭 No new lots to add.")
+        print("📭 No new lots.")
 
 if __name__ == "__main__":
     main()
