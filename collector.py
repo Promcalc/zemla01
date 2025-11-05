@@ -11,13 +11,13 @@ from html import unescape
 import gspread
 from google.oauth2.service_account import Credentials
 
-# from dotenv import load_dotenv
+#from dotenv import load_dotenv
 
 
 # Отключаем SSL-предупреждения
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# load_dotenv()  # загружает переменные из .env
+#load_dotenv()  # загружает переменные из .env
 
 # === Конфигурация ===
 RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?lotStatus=PUBLISHED,APPLICATIONS_SUBMISSION&catCode=2&byFirstVersion=true"
@@ -75,8 +75,18 @@ def extract_item_raw_fields(item) -> dict:
         fields['link'] = item.link
     if hasattr(item, 'description') and item.description:
         fields['description'] = item.description
-    if hasattr(item, 'published') and item.published:
+#    if hasattr(item, 'published') and item.published:
+#        fields['pubDate'] = item.published
+    # ✅ Конвертируем pubDate в ISO
+    if hasattr(item, 'published') and item.published and item.published_parsed:
+        try:
+            dt = datetime.fromtimestamp(time.mktime(item.published_parsed))
+            fields['pubDate'] = dt.isoformat()  # ← ISO-формат!
+        except:
+            fields['pubDate'] = item.published  # fallback
+    elif hasattr(item, 'published'):
         fields['pubDate'] = item.published
+
     if hasattr(item, 'id') and item.id:
         fields['guid'] = item.id
 
@@ -202,6 +212,73 @@ def build_row_for_sheet(item_fields, desc_fields, headers, cadastral_number="", 
         row[header_to_index["Unsorted"]] = "\n".join(unsorted_pairs)
     return row
 
+def find_last_filled_row_in_column(sheet, col_letter: str, max_rows_limit: int = 100000) -> int:
+    """
+    Находит номер последней непустой строки в указанной колонке Google Таблицы.
+    
+    Алгоритм:
+      1. Экспоненциальный рост: проверяем строки 1, 2, 4, 8, 16, ..., пока не найдём пустую.
+      2. Бинарный поиск между последней заполненной и первой пустой.
+    
+    Возвращает:
+      - Номер строки (int), если найдена хотя бы одна непустая строка (начиная с 2, т.к. 1 — заголовки)
+      - 0, если нет ни одной непустой строки после заголовков
+    """
+    low = 1  # первая строка — заголовки, нас интересует начиная со 2
+    high = 1
+
+    # Шаг 1: Экспоненциальный рост, пока не найдём пустую строку
+    while high <= max_rows_limit:
+        range_name = f"{col_letter}{high}:{col_letter}{high}"
+        try:
+#            print(range_name)
+            values = sheet.get(range_name)
+            if not values or not values[0] or not values[0][0].strip():
+                # Нашли пустую строку → останавливаемся
+                break
+        except Exception:
+            # Считаем пустой
+            break
+        low = high
+        high *= 2
+
+    # Ограничиваем сверху
+    high = min(high, max_rows_limit)
+
+    # Шаг 2: Бинарный поиск между low и high
+    last_filled = 0
+    while low <= high:
+        mid = (low + high) // 2
+        range_name = f"{col_letter}{mid}:{col_letter}{mid}"
+        try:
+            values = sheet.get(range_name)
+            if values and values[0] and values[0][0].strip():
+                last_filled = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        except Exception:
+            high = mid - 1
+
+    # Нас интересуют только строки после заголовков (>=2)
+    return last_filled if last_filled >= 2 else 0
+
+def parse_date_flexible(date_str: str):
+    """Парсит дату в ISO или RFC-2822 формате."""
+    if not date_str:
+        return None
+    # Сначала пробуем ISO
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except:
+        pass
+    # Потом RFC-2822
+    try:
+        import email.utils
+        return datetime.fromtimestamp(email.utils.parsedate_to_datetime(date_str).timestamp())
+    except:
+        return None
+
 # === ОСНОВНАЯ ЛОГИКА ===
 
 def main():
@@ -228,6 +305,7 @@ def main():
         first_row = headers
     else:
         first_row = sheet.row_values(1)
+        print(f"📝 Read first line Type: {type(first_row)} Value {first_row}")
 
     headers = first_row
     header_to_col = {name: i for i, name in enumerate(headers)}
@@ -237,24 +315,52 @@ def main():
             raise RuntimeError(f"Missing required column: {col}")
 
     # === Последняя дата публикации (последние 10 строк) ===
+#    pubdate_col_name = normalize_field_name("pubDate")
+#    last_pub_date = None
+#    if pubdate_col_name in header_to_col:
+#        col_letter = gspread.utils.rowcol_to_a1(1, header_to_col[pubdate_col_name] + 1)[0]
+#        total_rows = sheet.row_count
+#        start_row = max(2, total_rows - 9)
+#        range_name = f"{col_letter}{start_row}:{col_letter}"
+#        print(f"📝 Start row: {start_row} Range read: {range_name}")
+#        try:
+#            pubdate_values = sheet.get(range_name)
+#            for row in reversed(pubdate_values):
+#                if row and row[0].strip():
+#                    print(f"📝 Row values: {row}")
+#                    try:
+#                        last_pub_date = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+#                        break
+#                    except:
+#                        continue
+#        except Exception as e:
+#            print(f"⚠️ Could not read last pubDate: {e}")
+
+    # === Находим последнюю дату публикации (эффективно) ===
     pubdate_col_name = normalize_field_name("pubDate")
     last_pub_date = None
     if pubdate_col_name in header_to_col:
-        col_letter = gspread.utils.rowcol_to_a1(1, header_to_col[pubdate_col_name] + 1)[0]
-        total_rows = sheet.row_count
-        start_row = max(2, total_rows - 9)
-        range_name = f"{col_letter}{start_row}:{col_letter}"
-        try:
-            pubdate_values = sheet.get(range_name)
-            for row in reversed(pubdate_values):
-                if row and row[0].strip():
+        col_idx = header_to_col[pubdate_col_name]
+        col_letter = gspread.utils.rowcol_to_a1(1, col_idx + 1)[0]  # 'A', 'B', ...
+
+        last_row = find_last_filled_row_in_column(sheet, col_letter)
+        if last_row > 0:
+            range_name = f"{col_letter}{last_row}:{col_letter}{last_row}"
+            try:
+                values = sheet.get(range_name)
+                if values and values[0] and values[0][0].strip():
+                    date_str = values[0][0].strip()
                     try:
-                        last_pub_date = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
-                        break
-                    except:
-                        continue
-        except Exception as e:
-            print(f"⚠️ Could not read last pubDate: {e}")
+#                        last_pub_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                        last_pub_date = parse_date_flexible(date_str)
+                    except Exception as e:
+                        print(f"⚠️ Invalid date format in row {last_row}: {date_str} ({e})")
+            except Exception as e:
+                print(f"⚠️ Could not read date from row {last_row}: {e}")
+        else:
+            print("📭 No pubDate entries found in sheet")
+    else:
+        print("⚠️ Column 'Pubdate' not found in headers")
 
     print(f"🕗 Last processed pubDate: {last_pub_date}")
 
