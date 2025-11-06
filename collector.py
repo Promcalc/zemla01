@@ -11,13 +11,12 @@ from html import unescape
 import gspread
 from google.oauth2.service_account import Credentials
 
-#from dotenv import load_dotenv
-
+from dotenv import load_dotenv
 
 # Отключаем SSL-предупреждения
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-#load_dotenv()  # загружает переменные из .env
+load_dotenv()  # загружает переменные из .env
 
 # === Конфигурация ===
 RSS_URL = "https://torgi.gov.ru/new/api/public/lotcards/rss?lotStatus=PUBLISHED,APPLICATIONS_SUBMISSION&catCode=2&byFirstVersion=true"
@@ -25,12 +24,67 @@ MAP_URL = "https://nspd.gov.ru/map?thematic=PKK&zoom=14.022938145428002&coordina
 GEO_API_BASE = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
+# Новый заголовок
+LOT_INFO_COL = "Lot_info"
+
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 OPR/123.0.0.0 (Edition Yx 05)"
 
 # ✅ Исправленный регэксп: поддерживает 4–19 цифр в третьей части (квартал+участок)
 CADASTRAL_PATTERN = re.compile(r'\b\d{2}:\d{2}:\d{4,19}:\d{1,6}\b')
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+# Извлекает ID лота из ссылки
+def extract_lot_id_from_link(link: str) -> str:
+    """Из 'https://torgi.gov.ru/.../23000030610000000997_1  ' → '23000030610000000997_1'"""
+    if not link:
+        return ""
+    # Убираем пробелы в конце
+    link = link.strip()
+    # Берём часть после последнего '/'
+    parts = link.rstrip('/').split('/')
+    if parts:
+        lot_id = parts[-1]
+        # Оставляем только цифры, подчёркивания
+        lot_id_clean = re.sub(r'[^0-9_]', '', lot_id)
+        if lot_id_clean:
+            return lot_id_clean
+    return ""
+
+# Получает данные лота по ID
+def fetch_lot_info(lot_id: str, referer: str):
+    """Запрашивает детали лота с torgi.gov.ru"""
+    if not lot_id:
+        return None
+
+    url = f"https://torgi.gov.ru/new/api/public/lotcards/{lot_id}"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
+        "Referer": referer,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": USER_AGENT,
+        "branchId": "null",
+        "organizationId": "null",
+        "sec-ch-ua": '"Not;A=Brand";v="99", "Opera";v="123", "Chromium";v="139"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "traceparent": "00-4028d76347b5b5ea5b4479f015343701-e346b4143d2840ea-01"
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(f"⚠️ Lot info error {resp.status_code} for {lot_id}")
+            return None
+    except Exception as e:
+        print(f"💥 Lot info exception for {lot_id}: {e}")
+        return None
 
 def clean_html_tags(text: str) -> str:
     if not text:
@@ -183,7 +237,7 @@ def collect_all_field_names_from_items(items):
                 field_set.add(normalize_field_name(key))
         desc_fields = parse_description_fields(item_fields.get("description", ""))
         field_set.update(desc_fields.keys())
-    special_fields = {"Кадастровый номер", "Nspd_data", "Nspd_error", "Unsorted"}
+    special_fields = {"Кадастровый номер", "Nspd_data", "Nspd_error", "Unsorted", LOT_INFO_COL}
     field_set.update(special_fields)
     sorted_fields = sorted([f for f in field_set if f != "Unsorted"])
     sorted_fields.append("Unsorted")
@@ -284,6 +338,93 @@ def parse_date_flexible(date_str: str):
 def main():
     sheet = get_sheet()
 
+    # ================================
+    # 🔁 ОБРАБОТКА СУЩЕСТВУЮЩИХ ЗАПИСЕЙ (для первого прогона ПОСЛЕ добавления Lot_info)
+    # После завершения — ЗАКОММЕНТИРУЙТЕ этот блок!
+    # ================================
+    try:
+        first_row = sheet.row_values(1)
+        if LOT_INFO_COL in first_row:
+            print("🔧 Found existing table with Lot_info column. Processing old rows...")
+            link_col_idx = None
+            lot_info_col_idx = None
+            for i, name in enumerate(first_row):
+                if normalize_field_name("link") == normalize_field_name(name):
+                    link_col_idx = i
+                if name == LOT_INFO_COL:
+                    lot_info_col_idx = i
+
+        if link_col_idx is not None and lot_info_col_idx is not None:
+            last_row = find_last_filled_row_in_column(sheet, gspread.utils.rowcol_to_a1(1, link_col_idx + 1)[0])
+            if last_row > 0:
+                print(f"🧮 Processing rows 2 to {last_row} for Lot_info (in batches)...")
+                
+                # Определяем буквы колонок
+                link_col_letter = gspread.utils.rowcol_to_a1(1, link_col_idx + 1)[0]
+                lot_info_col_letter = gspread.utils.rowcol_to_a1(1, lot_info_col_idx + 1)[0]
+
+                batch_size = 30  # ≤30 — безопасно для лимитов
+                start_row = 2
+                while start_row <= last_row:
+                    end_row = min(start_row + batch_size - 1, last_row)
+                    print(f"  📥 Reading rows {start_row}–{end_row}...")
+
+                    # Пакетное чтение
+                    link_range = f"{link_col_letter}{start_row}:{link_col_letter}{end_row}"
+                    lot_info_range = f"{lot_info_col_letter}{start_row}:{lot_info_col_letter}{end_row}"
+                    
+                    try:
+                        batch_data = sheet.batch_get([link_range, lot_info_range])
+                        links_batch = batch_data[0] if len(batch_data) > 0 else []
+                        lot_info_batch = batch_data[1] if len(batch_data) > 1 else []
+                    except Exception as e:
+                        print(f"    ❌ Batch read error: {e}")
+                        time.sleep(10)
+                        start_row += batch_size
+                        continue
+
+                    # Обрабатываем пакет
+                    updates = []
+                    for i in range(len(links_batch)):
+                        row_num = start_row + i
+                        link_val = links_batch[i][0] if i < len(links_batch) and links_batch[i] else ""
+                        lot_info_val = lot_info_batch[i][0] if i < len(lot_info_batch) and lot_info_batch[i] else ""
+
+                        if link_val and (not lot_info_val or lot_info_val.strip() == ""):
+                            lot_id = extract_lot_id_from_link(link_val)
+                            if lot_id:
+                                print(f"    📥 Fetching lot info for {lot_id} (row {row_num})")
+                                lot_data = fetch_lot_info(lot_id, link_val)
+                                if lot_data:
+                                    cell_addr = gspread.utils.rowcol_to_a1(row_num, lot_info_col_idx + 1)
+                                    updates.append({
+                                        "range": cell_addr,
+                                        "values": [[json.dumps(lot_data, ensure_ascii=False)]]
+                                    })
+                                time.sleep(0.3)  # между запросами к torgi.gov.ru
+
+                    # Пакетная запись (если есть что обновлять)
+                    if updates:
+                        try:
+                            sheet.batch_update(updates)
+                            print(f"    ✅ Updated {len(updates)} rows")
+                        except Exception as e:
+                            print(f"    ❌ Batch update error: {e}")
+                            time.sleep(5)
+
+                    # Задержка перед следующим пакетом
+                    time.sleep(2.0)
+                    start_row += batch_size
+            else:
+                print("⚠️ Could not find Link or Lot_info columns")
+        else:
+            print("🆕 Lot_info column not present — skipping old rows processing")
+    except Exception as e:
+        print(f"⚠️ Old rows processing failed: {e}")
+    # ================================
+    # КОНЕЦ БЛОКА ДЛЯ ЗАКомМЕНТИРОВАНИЯ
+    # ================================
+
     # === Первый запуск? (только первая строка) ===
     try:
         first_row = sheet.row_values(1)
@@ -314,27 +455,6 @@ def main():
         if col not in header_to_col:
             raise RuntimeError(f"Missing required column: {col}")
 
-    # === Последняя дата публикации (последние 10 строк) ===
-#    pubdate_col_name = normalize_field_name("pubDate")
-#    last_pub_date = None
-#    if pubdate_col_name in header_to_col:
-#        col_letter = gspread.utils.rowcol_to_a1(1, header_to_col[pubdate_col_name] + 1)[0]
-#        total_rows = sheet.row_count
-#        start_row = max(2, total_rows - 9)
-#        range_name = f"{col_letter}{start_row}:{col_letter}"
-#        print(f"📝 Start row: {start_row} Range read: {range_name}")
-#        try:
-#            pubdate_values = sheet.get(range_name)
-#            for row in reversed(pubdate_values):
-#                if row and row[0].strip():
-#                    print(f"📝 Row values: {row}")
-#                    try:
-#                        last_pub_date = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
-#                        break
-#                    except:
-#                        continue
-#        except Exception as e:
-#            print(f"⚠️ Could not read last pubDate: {e}")
 
     # === Находим последнюю дату публикации (эффективно) ===
     pubdate_col_name = normalize_field_name("pubDate")
@@ -428,6 +548,16 @@ def main():
         desc_fields = parse_description_fields(item_fields.get("description", ""))
         cad_num = extract_cadastral_number_from_item(item_fields, desc_fields)
 
+        # ✅ Получаем Lot_info
+        lot_info = ""
+        link_val = item_fields.get("link", "")
+        if link_val:
+            lot_id = extract_lot_id_from_link(link_val)
+            if lot_id:
+                lot_data = fetch_lot_info(lot_id, link_val)
+                if lot_data:
+                    lot_info = json.dumps(lot_data, ensure_ascii=False)
+
         nspd_data, nspd_error = "", ""
         if cad_num:
             session = get_session_with_cookies()  # или переиспользуйте сессию
@@ -445,6 +575,11 @@ def main():
             nspd_data=nspd_data,
             nspd_error=nspd_error
         )
+
+        # Добавляем Lot_info вручную (т.к. его нет в item_fields)
+        if LOT_INFO_COL in header_to_col:
+            row[header_to_col[LOT_INFO_COL]] = lot_info
+
         new_rows.append(row)
         time.sleep(0.5)
 
