@@ -1,0 +1,11 @@
+# yandex-map-api/docker-compose.yml
+version: '3.8'
+
+services:
+  map-api:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../.env
+    restart: unless-stopped
