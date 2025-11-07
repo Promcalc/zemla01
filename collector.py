@@ -342,85 +342,86 @@ def main():
     # 🔁 ОБРАБОТКА СУЩЕСТВУЮЩИХ ЗАПИСЕЙ (для первого прогона ПОСЛЕ добавления Lot_info)
     # После завершения — ЗАКОММЕНТИРУЙТЕ этот блок!
     # ================================
-    try:
-        first_row = sheet.row_values(1)
-        if LOT_INFO_COL in first_row:
-            print("🔧 Found existing table with Lot_info column. Processing old rows...")
-            link_col_idx = None
-            lot_info_col_idx = None
-            for i, name in enumerate(first_row):
-                if normalize_field_name("link") == normalize_field_name(name):
-                    link_col_idx = i
-                if name == LOT_INFO_COL:
-                    lot_info_col_idx = i
+#    try:
+#        first_row = sheet.row_values(1)
+#        if LOT_INFO_COL in first_row:
+#            print("🔧 Found existing table with Lot_info column. Processing old rows...")
+#            link_col_idx = None
+#            lot_info_col_idx = None
+#            for i, name in enumerate(first_row):
+#                if normalize_field_name("link") == normalize_field_name(name):
+#                    link_col_idx = i
+#                if name == LOT_INFO_COL:
+#                    lot_info_col_idx = i
+#
+#        if link_col_idx is not None and lot_info_col_idx is not None:
+#            last_row = find_last_filled_row_in_column(sheet, gspread.utils.rowcol_to_a1(1, link_col_idx + 1)[0])
+#            if last_row > 0:
+#                print(f"🧮 Processing rows 2 to {last_row} for Lot_info (in batches)...")
+#                
+#                # Определяем буквы колонок
+#                link_col_letter = gspread.utils.rowcol_to_a1(1, link_col_idx + 1)[0]
+#                lot_info_col_letter = gspread.utils.rowcol_to_a1(1, lot_info_col_idx + 1)[0]
+#
+#                batch_size = 30  # ≤30 — безопасно для лимитов
+#                start_row = 2
+#                while start_row <= last_row:
+#                    end_row = min(start_row + batch_size - 1, last_row)
+#                    print(f"  📥 Reading rows {start_row}–{end_row}...")
+#
+#                    # Пакетное чтение
+#                    link_range = f"{link_col_letter}{start_row}:{link_col_letter}{end_row}"
+#                    lot_info_range = f"{lot_info_col_letter}{start_row}:{lot_info_col_letter}{end_row}"
+#                    
+#                    try:
+#                        batch_data = sheet.batch_get([link_range, lot_info_range])
+#                        links_batch = batch_data[0] if len(batch_data) > 0 else []
+#                        lot_info_batch = batch_data[1] if len(batch_data) > 1 else []
+#                    except Exception as e:
+#                        print(f"    ❌ Batch read error: {e}")
+#                        time.sleep(10)
+#                        start_row += batch_size
+#                        continue
+#
+#                    # Обрабатываем пакет
+#                    updates = []
+#                    for i in range(len(links_batch)):
+#                        row_num = start_row + i
+#                        link_val = links_batch[i][0] if i < len(links_batch) and links_batch[i] else ""
+#                        lot_info_val = lot_info_batch[i][0] if i < len(lot_info_batch) and lot_info_batch[i] else ""
+#
+#                        if link_val and (not lot_info_val or lot_info_val.strip() == ""):
+#                            lot_id = extract_lot_id_from_link(link_val)
+#                            if lot_id:
+#                                print(f"    📥 Fetching lot info for {lot_id} (row {row_num})")
+#                                lot_data = fetch_lot_info(lot_id, link_val)
+#                                if lot_data:
+#                                    cell_addr = gspread.utils.rowcol_to_a1(row_num, lot_info_col_idx + 1)
+#                                    updates.append({
+#                                        "range": cell_addr,
+#                                        "values": [[json.dumps(lot_data, ensure_ascii=False)]]
+#                                    })
+#                                time.sleep(0.3)  # между запросами к torgi.gov.ru
+#
+#                    # Пакетная запись (если есть что обновлять)
+#                    if updates:
+#                        try:
+#                            sheet.batch_update(updates)
+#                            print(f"    ✅ Updated {len(updates)} rows")
+#                        except Exception as e:
+#                            print(f"    ❌ Batch update error: {e}")
+#                            time.sleep(5)
+#
+#                    # Задержка перед следующим пакетом
+#                    time.sleep(2.0)
+#                    start_row += batch_size
+#            else:
+#                print("⚠️ Could not find Link or Lot_info columns")
+#        else:
+#            print("🆕 Lot_info column not present — skipping old rows processing")
+#    except Exception as e:
+#        print(f"⚠️ Old rows processing failed: {e}")
 
-        if link_col_idx is not None and lot_info_col_idx is not None:
-            last_row = find_last_filled_row_in_column(sheet, gspread.utils.rowcol_to_a1(1, link_col_idx + 1)[0])
-            if last_row > 0:
-                print(f"🧮 Processing rows 2 to {last_row} for Lot_info (in batches)...")
-                
-                # Определяем буквы колонок
-                link_col_letter = gspread.utils.rowcol_to_a1(1, link_col_idx + 1)[0]
-                lot_info_col_letter = gspread.utils.rowcol_to_a1(1, lot_info_col_idx + 1)[0]
-
-                batch_size = 30  # ≤30 — безопасно для лимитов
-                start_row = 2
-                while start_row <= last_row:
-                    end_row = min(start_row + batch_size - 1, last_row)
-                    print(f"  📥 Reading rows {start_row}–{end_row}...")
-
-                    # Пакетное чтение
-                    link_range = f"{link_col_letter}{start_row}:{link_col_letter}{end_row}"
-                    lot_info_range = f"{lot_info_col_letter}{start_row}:{lot_info_col_letter}{end_row}"
-                    
-                    try:
-                        batch_data = sheet.batch_get([link_range, lot_info_range])
-                        links_batch = batch_data[0] if len(batch_data) > 0 else []
-                        lot_info_batch = batch_data[1] if len(batch_data) > 1 else []
-                    except Exception as e:
-                        print(f"    ❌ Batch read error: {e}")
-                        time.sleep(10)
-                        start_row += batch_size
-                        continue
-
-                    # Обрабатываем пакет
-                    updates = []
-                    for i in range(len(links_batch)):
-                        row_num = start_row + i
-                        link_val = links_batch[i][0] if i < len(links_batch) and links_batch[i] else ""
-                        lot_info_val = lot_info_batch[i][0] if i < len(lot_info_batch) and lot_info_batch[i] else ""
-
-                        if link_val and (not lot_info_val or lot_info_val.strip() == ""):
-                            lot_id = extract_lot_id_from_link(link_val)
-                            if lot_id:
-                                print(f"    📥 Fetching lot info for {lot_id} (row {row_num})")
-                                lot_data = fetch_lot_info(lot_id, link_val)
-                                if lot_data:
-                                    cell_addr = gspread.utils.rowcol_to_a1(row_num, lot_info_col_idx + 1)
-                                    updates.append({
-                                        "range": cell_addr,
-                                        "values": [[json.dumps(lot_data, ensure_ascii=False)]]
-                                    })
-                                time.sleep(0.3)  # между запросами к torgi.gov.ru
-
-                    # Пакетная запись (если есть что обновлять)
-                    if updates:
-                        try:
-                            sheet.batch_update(updates)
-                            print(f"    ✅ Updated {len(updates)} rows")
-                        except Exception as e:
-                            print(f"    ❌ Batch update error: {e}")
-                            time.sleep(5)
-
-                    # Задержка перед следующим пакетом
-                    time.sleep(2.0)
-                    start_row += batch_size
-            else:
-                print("⚠️ Could not find Link or Lot_info columns")
-        else:
-            print("🆕 Lot_info column not present — skipping old rows processing")
-    except Exception as e:
-        print(f"⚠️ Old rows processing failed: {e}")
     # ================================
     # КОНЕЦ БЛОКА ДЛЯ ЗАКомМЕНТИРОВАНИЯ
     # ================================
