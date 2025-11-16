@@ -10,86 +10,115 @@
     .popup-desc { font-size: 14px; margin-bottom: 8px; color: #333; }
     .popup-link { color: #1976d2; text-decoration: none; }
     .popup-link:hover { text-decoration: underline; }
+
+    .popup-lot {
+      margin-bottom: 8px;
+    }
+    .popup-lot:last-child {
+      margin-bottom: 0;
+    }
+    .popup-lot hr {
+      margin: 12px 0;
+      border: 0;
+      border-top: 1px solid #eee;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
 
   <script>
-    // 🔒 Безопасное экранирование HTML
-    function escapeHtml(str) {
-      if (typeof str !== 'string') return str == null ? '' : String(str);
-      return str
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "<")
-        .replace(/>/g, ">")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-    }
+ymaps.ready(init);
 
-//    const lots = [
-//      {
-//        lat: 55.526037,
-//        lon: 49.516702,
-//        lotName: "лот 7 Площадь участка – 1335 кв.м., местоположение: РТ, Лаишевский муниципальный район...",
-//        lotDescription: "Площадь участка – 1335 кв.м., местоположение: РТ, Лаишевский муниципальный район, Александровское сельское поселение, с.Бутыри...",
-//        link: "https://docs.google.com/spreadsheets/d/1abc123/edit#gid=0&range=A7"
-//      }
-//    ];
+function escapeHtml(str) {
+  if (typeof str !== 'string') return str == null ? '' : String(str);
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "<")
+    .replace(/>/g, ">")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
 
+function init() {
+  const map = new ymaps.Map("map", {
+    center: [55.830431, 49.066143], // Казань по умолчанию
+    zoom: 10,
+    controls: ['zoomControl', 'searchControl']
+  });
 
-// Вместо статического массива lots:
-let lots = [];
+  const clusterer = new ymaps.Clusterer({
+    preset: 'islands#invertedVioletClusterIcons',
+    clusterDisableClickZoom: false,
+    clusterOpenBalloonOnClick: true
+  });
 
-    ymaps.ready(init);
+  fetch('http://localhost:8080/api/points')
+    .then(response => {
+      if (!response.ok) throw new Error('Ошибка сети');
+      return response.json();
+    })
+    .then(lots => {
+      // 🔹 Группировка по координатам
+      const groups = new Map(); // ключ: "lat,lon", значение: LotPoint[]
 
-    function init() {
-      const map = new ymaps.Map("map", {
-        center: [55.526, 49.516],
-        zoom: 14,
-        controls: ['zoomControl']
+      lots.forEach(lot => {
+        if (typeof lot.lat !== 'number' || typeof lot.lon !== 'number') return;
+        const key = `${lot.lat.toFixed(6)},${lot.lon.toFixed(6)}`; // точность до 6 знаков
+        if (!groups.has(key)) {
+          groups.set(key, []);
+        }
+        groups.get(key).push(lot);
       });
 
-    fetch('http://localhost:8080/api/points')
-      .then(response => {
-        if (!response.ok) throw new Error('Сетевая ошибка');
-        return response.json();
-      })
-      .then(data => {
-        lots = data;
-        // ... остальной код: создание placemarks, кластеризатор и т.д.
+      // 🔹 Создаём по одной метке на группу
+      const placemarks = Array.from(groups.entries()).map(([key, lotGroup]) => {
+        const [latStr, lonStr] = key.split(',');
+        const lat = parseFloat(latStr);
+        const lon = parseFloat(lonStr);
 
-        const clusterer = new ymaps.Clusterer({
-          preset: 'islands#invertedVioletClusterIcons'
-        });
+        // Формируем общий балун со всеми лотами
+        const balloonContent = lotGroup.map(lot => `
+          <div class="popup-lot">
+            <div class="popup-title">${escapeHtml(lot.lotName)}</div>
+            <div class="popup-desc">${escapeHtml(lot.lotDescription)}</div>
+            <a class="popup-link" href="${escapeHtml(lot.link)}" target="_blank">Открыть в Google Таблице</a>
+          </div>
+          <hr style="margin:12px 0; border:0; border-top:1px solid #eee;">
+        `).join('');
 
-        const placemarks = lots.map(lot => {
-          return new ymaps.Placemark(
-            [lot.lat, lot.lon],
-            {
-              balloonContent: `
-                <div class="popup-title">${escapeHtml(lot.lotName)}</div>
-                <div class="popup-desc">${escapeHtml(lot.lotDescription)}</div>
-                <a class="popup-link" href="${escapeHtml(lot.link)}" target="_blank">Открыть в Google Таблице</a>
-              `,
-              hintContent: escapeHtml(lot.lotName)
-            },
-            {
-              preset: 'islands#violetDotIconWithCaption'
-            }
-          );
-        });
-  
-        clusterer.add(placemarks);
-        map.geoObjects.add(clusterer);
+        // Убираем последний <hr>
+        const cleanBalloon = balloonContent.replace(/<hr[^>]*>$/, '');
 
-      })
-      .catch(err => {
-        console.error('❌ Ошибка загрузки лотов:', err);
-        alert('Не удалось загрузить данные с сервера');
+        return new ymaps.Placemark(
+          [lat, lon],
+          {
+            balloonContent: cleanBalloon,
+            hintContent: `Лотов: ${lotGroup.length}`
+          },
+          {
+            preset: lotGroup.length > 1 
+              ? 'islands#redDotIcon' 
+              : 'islands#violetDotIconWithCaption',
+            iconCaption: lotGroup.length > 1 ? String(lotGroup.length) : undefined
+          }
+        );
       });
 
-    }
+      clusterer.add(placemarks);
+      map.geoObjects.add(clusterer);
+
+      // Автоцентрирование по всем точкам
+      if (lots.length > 0) {
+        const points = lots.map(l => [l.lat, l.lon]);
+        map.setBounds(ymaps.util.bounds.fromPoints(points), { zoomMargin: 40 });
+      }
+    })
+    .catch(err => {
+      console.error('❌ Ошибка загрузки данных:', err);
+      alert('Не удалось загрузить лоты');
+    });
+}
   </script>
 </body>
 </html>

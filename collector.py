@@ -29,10 +29,32 @@ LOT_INFO_COL = "Lot_info"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 OPR/123.0.0.0 (Edition Yx 05)"
 
+MAX_CELL_CHARS = 50000
+
 # ✅ Исправленный регэксп: поддерживает 4–19 цифр в третьей части (квартал+участок)
 CADASTRAL_PATTERN = re.compile(r'\b\d{2}:\d{2}:\d{4,19}:\d{1,6}\b')
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+def validate_and_truncate_row(row: list, headers: list, row_index_in_batch: int, lot_id: str = "") -> list:
+    """
+    Проверяет каждую ячейку в строке на превышение лимита Google Sheets (50k символов).
+    Если превышает — заменяет на пустую строку и выводит предупреждение.
+    """
+    validated_row = []
+    for col_idx, cell_value in enumerate(row):
+        cell_str = str(cell_value) if cell_value is not None else ""
+        if len(cell_str) > MAX_CELL_CHARS:
+            field_name = headers[col_idx] if col_idx < len(headers) else f"Column_{col_idx}"
+            preview = cell_str.replace("\n", "\\n")
+            print(f"⚠️ CELL TOO LONG (row {row_index_in_batch}, lot '{lot_id}')")
+            print(f"   Field: {field_name}")
+            print(f"   Length: {len(cell_str)} chars (max {MAX_CELL_CHARS})")
+            print(f"   Preview: {preview}")
+            validated_row.append("")  # сохраняем пусто, чтобы не сломать вставку
+        else:
+            validated_row.append(cell_value)
+    return validated_row
 
 # Извлекает ID лота из ссылки
 def extract_lot_id_from_link(link: str) -> str:
@@ -584,9 +606,32 @@ def main():
         new_rows.append(row)
         time.sleep(0.5)
 
+#    if new_rows:
+#        print(f"✅ Appending {len(new_rows)} new rows")
+#        sheet.append_rows(new_rows)
     if new_rows:
         print(f"✅ Appending {len(new_rows)} new rows")
-        sheet.append_rows(new_rows)
+        validated_rows = []
+        for i, row in enumerate(new_rows):
+            # Попытаемся получить lot_id из строки (например, из колонки Link)
+            lot_id = ""
+            try:
+                link_col_name = normalize_field_name("link")
+                if link_col_name in header_to_col:
+                    link_val = row[header_to_col[link_col_name]]
+                    lot_id = extract_lot_id_from_link(link_val)
+            except:
+                pass
+    
+            validated_row = validate_and_truncate_row(
+                row=row,
+                headers=headers,
+                row_index_in_batch=i + 1,  # нумерация с 1
+                lot_id=lot_id
+            )
+            validated_rows.append(validated_row)
+    
+        sheet.append_rows(validated_rows)
     else:
         print("📭 No new lots.")
 

@@ -9,3 +9,11 @@ services:
     env_file:
       - ../.env
     restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.25.0/28
